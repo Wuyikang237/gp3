@@ -1,0 +1,73 @@
+import torch
+import torch.nn as nn
+from ultralytics.nn.modules import Detect, C2f, Conv
+from ultralytics.utils.loss import v8DetectionLoss
+from fasternet import FasterNet
+
+class FasterNetYOLO(nn.Module):
+    def __init__(self, nc=2, embed_dim=96, depths=(1,2,8,2), mlp_ratio=2., **kwargs):
+        super().__init__()
+        self.nc = nc
+
+        # 主干
+        self.backbone = FasterNet(
+            in_chans=3,
+            embed_dim=embed_dim,
+            depths=depths,
+            mlp_ratio=mlp_ratio,
+            fork_feat=True,
+            **kwargs
+        )
+
+        # 通道数
+        c2 = embed_dim * 2
+        c3 = embed_dim * 4
+        c4 = embed_dim * 8
+
+        # 检测头
+        self.conv_c2 = Conv(c2, 256, 1)
+        self.conv_c3 = Conv(c3, 512, 1)
+        self.conv_c4 = Conv(c4, 1024, 1)
+
+        self.upsample = nn.Upsample(scale_factor=2, mode='nearest')
+        self.c2f_1 = C2f(512, 512)
+        self.c2f_2 = C2f(256, 256)
+        self.c2f_3 = C2f(512, 512)
+        self.c2f_4 = C2f(1024, 1024)
+        self.down_1 = Conv(256, 256, 3, 2)
+        self.down_2 = Conv(512, 512, 3, 2)
+        self.detect = Detect(nc=nc, ch=(256, 512, 1024))
+
+        # 损失函数将在第一次调用时创建
+        self.criterion = None
+
+    def forward(self, x):
+        features = self.backbone.forward_det(x)
+        f1, f2, f3 = features[1], features[2], features[3]
+
+        p3 = self.conv_c2(f1)
+        p4 = self.conv_c3(f2)
+        p5 = self.conv_c4(f3)
+
+        up4 = self.upsample(p5)
+        cat4 = torch.cat([up4, p4], dim=1)
+        x4 = self.c2f_1(cat4)
+
+        up3 = self.upsample(x4)
+        cat3 = torch.cat([up3, p3], dim=1)
+        x3 = self.c2f_2(cat3)
+
+        down3 = self.down_1(x3)
+        cat_down4 = torch.cat([down3, x4], dim=1)
+        x4_new = self.c2f_3(cat_down4)
+
+        down4 = self.down_2(x4_new)
+        cat_down5 = torch.cat([down4, p5], dim=1)
+        x5 = self.c2f_4(cat_down5)
+
+        return self.detect([x3, x4_new, x5])
+
+    def loss(self, preds, batch):
+        if self.criterion is None:
+            self.criterion = v8DetectionLoss(self)
+        return self.criterion(preds, batch)

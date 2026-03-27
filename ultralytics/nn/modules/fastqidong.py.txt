@@ -1,0 +1,11 @@
+from ultralytics import YOLO
+from fasternet_yolo import FasterNetYOLO
+
+# 实例化自定义模型
+model = FasterNetYOLO(nc=2, embed_dim=96, depths=(1,2,8,2))
+
+# 包装为 YOLO 对象
+yolo_model = YOLO(model)
+
+# 训练
+yolo_model.train(data='/home/wuyikang/finalgp/ultralytics/ultralytics/nn/modules/fasternetdatasets.yaml', epochs=50)

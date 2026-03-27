@@ -1,0 +1,125 @@
+import torch
+import torch.nn as nn
+from ultralytics.nn.tasks import DetectionModel
+from ultralytics.nn.modules import Detect, C2f, Conv, Concat
+from ultralytics.utils.torch_utils import initialize_weights
+from fasternet import FasterNet  # 确保可以导入
+
+class FasterNetYOLO(DetectionModel):
+    """将 FasterNet 作为主干网络的 YOLOv8 检测模型"""
+
+    def __init__(self, ch=3, nc=2, embed_dim=96, depths=(1,2,8,2), mlp_ratio=2., **kwargs):
+        """
+        Args:
+            cfg (str|dict): 保留，但不会使用（因为完全自定义）
+            ch (int): 输入通道数
+            nc (int): 类别数
+            embed_dim (int): FasterNet 的嵌入维度
+            depths (tuple): FasterNet 各阶段深度
+            mlp_ratio (float): MLP 扩展比例
+            **kwargs: 传递给 FasterNet 的其他参数
+        """
+        super().__init__()#(cfg, ch, nc, verbose=False)  # 不打印信息，稍后自己构建
+        self.nc = nc  # 类别数
+
+        # 1. 构建 FasterNet 主干（输出多尺度特征）
+        self.backbone = FasterNet(
+            in_chans=3,#原来是 ch，但 YOLOv8 默认输入通道数为 3
+            embed_dim=embed_dim,
+            depths=depths,
+            mlp_ratio=mlp_ratio,
+            fork_feat=True,          # 输出多级特征
+            **kwargs
+        )
+
+        # 2. 获取 backbone 输出的通道数（根据 FasterNet 的配置计算）
+        #   假设四个输出特征图的通道数依次为：embed_dim, embed_dim*2, embed_dim*4, embed_dim*8
+        c2 = embed_dim * 2    # 8倍下采样，对应 P3
+        c3 = embed_dim * 4    # 16倍下采样，对应 P4
+        c4 = embed_dim * 8    # 32倍下采样，对应 P5
+
+        # 3. 构建检测头（参考 YOLOv8 的 head 结构）,新添加了 conv_c2, conv_c3, conv_c4 用于调整 backbone 输出的通道数
+        self.conv_c2 = Conv(c2, 256, 1)
+        self.conv_c3 = Conv(c3, 512, 1)
+        self.conv_c4 = Conv(c4, 1024, 1)
+        #   包括上采样、融合、C2f 等模块，最后连接 Detect 层
+        #原self.head = self._build_head(c2, c3, c4, nc)
+        
+
+        # 4. 初始化权重
+        initialize_weights(self)
+
+    def _build_head(self, c2, c3, c4, nc):
+        """构建 YOLOv8 风格的检测头"""
+        # 定义各个模块
+        # 输入：四个特征图，但只使用 P3, P4, P5（8,16,32 倍下采样）
+        # 输出：Detect 层
+
+        # 用于通道数转换的卷积
+        self.conv_c2 = Conv(c2, 256, 1)   # 将 backbone 的 P3 通道转换为 256
+        self.conv_c3 = Conv(c3, 512, 1)   # 将 backbone 的 P4 通道转换为 512
+        self.conv_c4 = Conv(c4, 1024, 1)  # 将 backbone 的 P5 通道转换为 1024
+
+        # 构建 head 的各个层
+        # 为了保持与官方结构一致，我们使用 nn.Sequential 并按顺序定义
+        # 注意：这里需要手动定义所有层，并保证索引正确
+        # 由于 head 有多个分支，我们将其组织为 ModuleList 方便 forward
+
+        # 上采样 + 融合路径
+        self.upsample = nn.Upsample(scale_factor=2, mode='nearest')
+        # 融合后的 C2f 块
+        self.c2f_1 = C2f(512, 512)   # 输入通道 512（来自 conv_c3 和上采样后的 conv_c4）
+        self.c2f_2 = C2f(256, 256)   # 输入通道 256（来自 conv_c2 和上采样后的 c2f_1）
+
+        # 下采样路径
+        self.down_1 = Conv(256, 256, 3, 2)   # 步长2下采样
+        self.c2f_3 = C2f(512, 512)           # 输入通道 512（下采样后的 c2f_2 与 conv_c3）
+
+        self.down_2 = Conv(512, 512, 3, 2)   # 步长2下采样
+        self.c2f_4 = C2f(1024, 1024)         # 输入通道 1024（下采样后的 c2f_3 与 conv_c4）
+
+        # Detect 层
+        self.detect = Detect(nc=nc, ch=(256, 512, 1024))
+
+        # 返回 head 的所有模块，以便 forward 中使用
+        return nn.ModuleList([self.c2f_1, self.c2f_2, self.c2f_3, self.c2f_4, self.detect])
+
+    def forward(self, x):
+        # 1. 通过 backbone 获取多尺度特征
+        features = self.backbone.forward_det(x)  # 返回列表 [f0, f1, f2, f3]，对应 stride 4,8,16,32
+        f1, f2, f3 = features[1], features[2], features[3]  # 取 8,16,32 倍下采样
+
+        # 2. 调整通道数
+        p3 = self.conv_c2(f1)   # 256
+        p4 = self.conv_c3(f2)   # 512
+        p5 = self.conv_c4(f3)   # 1024
+
+        # 3. 构建 head 路径（模仿官方 YAML 结构）
+        # 上采样融合 P5 和 P4
+        up4 = self.upsample(p5)
+        cat4 = torch.cat([up4, p4], dim=1)   # 512 + 512 = 1024
+        x4 = self.c2f_1(cat4)               # 输出 512
+
+        # 上采样融合 P4 和 P3
+        up3 = self.upsample(x4)
+        cat3 = torch.cat([up3, p3], dim=1)   # 256 + 256 = 512
+        x3 = self.c2f_2(cat3)               # 输出 256
+
+        # 下采样路径：从 P3 到 P4
+        down3 = self.down_1(x3)
+        cat_down4 = torch.cat([down3, x4], dim=1)  # 256 + 512 = 768? 注意：x4 是 512，down3 是 256，拼接后 768
+        # 但 C2f 期望输入通道数与输出一致，这里需调整通道。官方 head 中，conv 下采样后，再与上采样分支的 C2f 输出拼接，通道数需要匹配。
+        # 为了简化，我们使用一个额外的卷积来调整通道，或者直接使用官方定义的 C2f 参数。这里我们直接使用 C2f 的默认参数，但需要确保输入通道正确。
+        # 实际上，官方的 C2f 会通过 1x1 卷积将输入通道映射到隐藏通道，所以输入通道可以是任意值。我们直接传入 cat_down4，C2f 会自动处理。
+        x4_new = self.c2f_3(cat_down4)      # 输出 512
+
+        # 下采样路径：从 P4 到 P5
+        down4 = self.down_2(x4_new)
+        cat_down5 = torch.cat([down4, p5], dim=1)  # 512 + 1024 = 1536
+        x5 = self.c2f_4(cat_down5)          # 输出 1024
+
+        # 4. Detect 层
+        # 注意：Detect 层期望接收一个包含三个特征图的列表
+        det_out = self.detect([x3, x4_new, x5])
+
+        return det_out

@@ -1,0 +1,121 @@
+import torch
+import torch.nn as nn
+from ultralytics.nn.tasks import DetectionModel
+from ultralytics.nn.modules import Detect, C2f, Conv
+from ultralytics.utils.torch_utils import initialize_weights
+from fasternet import FasterNet
+
+class FasterNetYOLO(DetectionModel):
+    def __init__(self, cfg='yolov8n.yaml', ch=3, nc=2, embed_dim=96, depths=(1,2,8,2), mlp_ratio=2., **kwargs):
+        # 1. 先让父类构建一个标准模型（用于计算 stride 等）
+        super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=False)
+        
+        # 2. 构建 FasterNet 主干
+        backbone = FasterNet(
+            in_chans=ch,
+            embed_dim=embed_dim,
+            depths=depths,
+            mlp_ratio=mlp_ratio,
+            fork_feat=True,
+            **kwargs
+        )
+        
+        # 3. 计算各阶段通道数（FasterNet 输出 stride 4,8,16,32 的特征）
+        c2 = embed_dim * 2   # 8倍下采样
+        c3 = embed_dim * 4   # 16倍下采样
+        c4 = embed_dim * 8   # 32倍下采样
+        
+        # 4. 构建检测头（返回 ModuleDict）
+        head = self._build_head(c2, c3, c4, nc)
+        
+        # 5. 将 backbone 和 head 封装为一个自定义模型
+        class CustomModel(nn.Module):
+            def __init__(self, backbone, head):
+                super().__init__()
+                self.backbone = backbone
+                self.head = head
+                # 添加训练器需要的属性
+                self.end2end = False
+                self.stride = torch.tensor([32.])   # 占位，后续会被检测头覆盖
+                self.args = {}
+                self.names = {i: f"{i}" for i in range(nc)}
+                self.nc = nc
+
+            def forward(self, x):
+                features = self.backbone.forward_det(x)   # [f0, f1, f2, f3]
+                f1, f2, f3 = features[1], features[2], features[3]  # P3, P4, P5
+                
+                p3 = self.head['conv_c2'](f1)   # 256
+                p4 = self.head['conv_c3'](f2)   # 512
+                p5 = self.head['conv_c4'](f3)   # 1024
+                
+                # 上采样融合 P5 和 P4
+                up4 = self.head['upsample'](p5)
+                cat4 = torch.cat([up4, p4], dim=1)      # 1024
+                x4 = self.head['c2f_1'](cat4)           # 512
+                
+                # 上采样融合 P4 和 P3
+                up3 = self.head['upsample'](x4)
+                cat3 = torch.cat([up3, p3], dim=1)      # 512
+                x3 = self.head['c2f_2'](cat3)           # 256
+                
+                # 下采样融合 P3 到 P4
+                down3 = self.head['down_1'](x3)
+                cat_down4 = torch.cat([down3, x4], dim=1)  # 256+512=768
+                x4_new = self.head['c2f_3'](cat_down4)     # 512
+                
+                # 下采样融合 P4 到 P5
+                down4 = self.head['down_2'](x4_new)
+                cat_down5 = torch.cat([down4, p5], dim=1)  # 512+1024=1536
+                x5 = self.head['c2f_4'](cat_down5)         # 1024
+                
+                # Detect 层
+                out = self.head['detect']([x3, x4_new, x5])
+                return out
+        
+        # 6. 替换父类的 model 为我们自定义的模型
+        self.model = CustomModel(backbone, head)
+        
+        # 7. 将父类中计算好的 stride 复制给自定义模型（可选，训练时检测头会重新计算）
+        if hasattr(self, 'stride'):
+            self.model.stride = self.stride
+        
+        # 8. 初始化权重（注意：backbone 如果加载了预训练，这里会覆盖，可自行调整）
+        initialize_weights(self.model)
+    
+    def _build_head(self, c2, c3, c4, nc):
+        """构建 YOLOv8 风格的检测头，返回 ModuleDict"""
+        # 通道转换层
+        conv_c2 = Conv(c2, 256, 1)
+        conv_c3 = Conv(c3, 512, 1)
+        conv_c4 = Conv(c4, 1024, 1)
+        
+        # 上采样
+        upsample = nn.Upsample(scale_factor=2, mode='nearest')
+        
+        # C2f 模块
+        c2f_1 = C2f(512, 512)
+        c2f_2 = C2f(256, 256)
+        c2f_3 = C2f(512, 512)
+        c2f_4 = C2f(1024, 1024)
+        
+        # 下采样卷积
+        down_1 = Conv(256, 256, 3, 2)
+        down_2 = Conv(512, 512, 3, 2)
+        
+        # Detect 层
+        detect = Detect(nc=nc, ch=(256, 512, 1024))
+        
+        return nn.ModuleDict({
+            'conv_c2': conv_c2,
+            'conv_c3': conv_c3,
+            'conv_c4': conv_c4,
+            'upsample': upsample,
+            'c2f_1': c2f_1,
+            'c2f_2': c2f_2,
+            'c2f_3': c2f_3,
+            'c2f_4': c2f_4,
+            'down_1': down_1,
+            'down_2': down_2,
+            'detect': detect,
+        })
