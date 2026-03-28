@@ -16,6 +16,8 @@ Examples:
     >>> torch.onnx.export(m, x, f)
     >>> subprocess.run(f"onnxslim {f} {f} && open {f}", shell=True, check=True)  # pip install onnxslim
 """
+# SIMAM 注意力模块
+from .simam_module import simam_module
 
 from .block import (
     C1,
@@ -187,4 +189,5 @@ __all__ = (
     "YOLOESegment",
     "YOLOESegment26",
     "v10Detect",
+    "simam_module",# SIMAM 注意力模块
 )
