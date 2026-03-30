@@ -71,7 +71,7 @@ trainer.train()
 """
 import torch
 from ultralytics.models.yolo.detect import DetectionTrainer
-from fasternet_yolo import FasterNetYOLO  # 你的自定义模型
+from ultralytics.nn.modules.fasternet_simAM_yolo import FasterNetYOLO  # 你的自定义模型
 
 # 1. 实例化模型
 model = FasterNetYOLO(

@@ -2,8 +2,8 @@ import torch
 import torch.nn as nn
 from ultralytics.nn.modules import Detect, C2f, Conv
 from ultralytics.utils.torch_utils import initialize_weights
-from fasternet import FasterNet
-from simam_module import simam_module   # 导入 SimAM 模块
+from .fasternet import FasterNet
+from .simam_module import simam_module   # 导入 SimAM 模块
 class FasterNetYOLO(nn.Module):
     def __init__(self, nc=80, ch=3, embed_dim=96, depths=(1,2,8,2), mlp_ratio=2., **kwargs):
         super().__init__()
@@ -33,7 +33,9 @@ class FasterNetYOLO(nn.Module):
 
         # 模拟官方模型结构，使损失函数能正确访问检测头
         self.model = [self.head['detect']]
-        self.register_buffer('stride', torch.tensor([32.]))
+        self.register_buffer('stride', torch.tensor([8.0, 16.0, 32.0]))
+        self.head['detect'].stride = self.stride
+        self.head['detect'].bias_init()
 
         # 创建 SimAM 实例（无参数，但可指定 e_lambda）
         self.simam = simam_module(e_lambda=1e-4)   # 可根据需要调整
