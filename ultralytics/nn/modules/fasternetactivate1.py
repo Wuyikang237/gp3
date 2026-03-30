@@ -1,5 +1,5 @@
 from ultralytics import YOLO
-from ultralytics.ultralytics.nn.modules.fasternet_simAM_yolo import FasterNetYOLO  # 导入自定义模型
+from fasternet_simAM_yolo import FasterNetYOLO  # 导入自定义模型
 
 # 实例化模型
 model = FasterNetYOLO(nc=2, embed_dim=96, depths=(1,2,8,2))
